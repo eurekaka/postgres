@@ -925,6 +925,23 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 }
 
 
+int32 global_counter = 0;
+Datum
+get_raft_counter(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(global_counter);
+}
+
+
+Datum
+set_raft_counter(PG_FUNCTION_ARGS)
+{
+	int32 cnt = PG_GETARG_INT32(0);
+	global_counter = cnt;
+	PG_RETURN_INT32(global_counter);
+}
+
+
 Datum
 pg_backend_pid(PG_FUNCTION_ARGS)
 {
