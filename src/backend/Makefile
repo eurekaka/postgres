@@ -21,7 +21,7 @@ SUBDIRS = access bootstrap catalog parser commands executor foreign lib libpq \
 	main nodes optimizer partitioning port postmaster \
 	regex replication rewrite \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
-	jit
+	jit raft
 
 include $(srcdir)/common.mk
 
@@ -50,6 +50,8 @@ LIBS := $(filter-out -lz -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS)
 ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
+
+LIBS += -lraft -luv
 
 ##########################################################################
 
