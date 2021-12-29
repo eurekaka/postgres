@@ -20,6 +20,7 @@
 #include "pgstat.h"
 #include "postmaster/raftserver.h"
 #include "replication/raftrep.h"
+#include "raft/pg_raft.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -31,6 +32,8 @@
  */
 char *Raft_log_directory = "raft_log";
 
+static pg_raft_node *raft_node = NULL;
+
 static volatile sig_atomic_t check_requested = false;
 static volatile sig_atomic_t shutdown_requested = false;
 
@@ -39,8 +42,8 @@ static void raftserver_shutdown_handler(SIGNAL_ARGS);
 static void raftserver_check_handler(SIGNAL_ARGS);
 static void raftserver_quickdie(SIGNAL_ARGS);
 
-static int shutdown_raft_server(void);
-static int start_raft_server(void);
+static void shutdown_raft_server(void);
+static void start_raft_server(void);
 static int maybe_send_raft_log(void);
 
 /*
@@ -76,7 +79,7 @@ RaftServerMain()
 	(void) MakePGDirectory(Raft_log_directory);
 
 	RaftRepInitConfig();
-	(void) start_raft_server();
+	start_raft_server();
 
 	/* Notify postmaster we are ready */
 	SendPostmasterSignal(PMSIGNAL_RAFTSERVER_READY);
@@ -97,7 +100,7 @@ RaftServerMain()
 		{
 			/* Finish sync of the remaining raft logs */
 			(void) maybe_send_raft_log();
-			(void) shutdown_raft_server();
+			shutdown_raft_server();
 			/* Normal exit from the raftserver is here */
 			proc_exit(0);
 		}
@@ -115,16 +118,36 @@ RaftServerMain()
 	}
 }
 
-static int
+static void
 shutdown_raft_server(void)
 {
-	return 0;
+	int rc = 0;
+
+	rc = pg_raft_node_stop(raft_node);
+	if (rc != 0)
+		ereport(FATAL,
+				(errmsg("pg_raft_node_stop failed with return code %d, \
+				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
+
+	pg_raft_node_destroy(raft_node);
 }
 
-static int
+static void
 start_raft_server(void)
 {
-	return 0;
+	int rc = 0;
+
+	rc = pg_raft_node_create((pg_raft_node_id) 1,
+							"127.0.0.1:5000", Raft_log_directory, &raft_node);
+	if (rc != 0)
+		ereport(FATAL,
+				(errmsg("pg_raft_node_create failed with return code %d", rc)));
+
+	rc = pg_raft_node_start(raft_node);
+	if (rc != 0)
+		ereport(FATAL,
+				(errmsg("pg_raft_node_start failed with return code %d, \
+				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
 }
 
 static int

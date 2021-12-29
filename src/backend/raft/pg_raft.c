@@ -37,6 +37,18 @@ pg_raft_tracing_maybe_enable(bool enable)
 #define PTR_TO_UINT64(p) ((uint64_t)((uintptr_t)(p)))
 #define UINT64_TO_PTR(u, ptr_type) ((ptr_type)((uintptr_t)(u)))
 
+/**
+ * Initialize the config object with required values and set the rest to sane
+ * defaults. A copy will be made of the given @address.
+ */
+static int pg_raft_config_init(struct pg_raft_config *c,
+								pg_raft_node_id id, const char *address);
+
+/**
+ * Release any memory held by the config object.
+ */
+static void pg_raft_config_close(struct pg_raft_config *c);
+
 static int pg_raft_fsm_init(struct raft_fsm *fsm);
 static void pg_raft_fsm_close(struct raft_fsm *f);
 
@@ -124,8 +136,7 @@ pg_raft_node_close(struct pg_raft_node *n)
 	rv = sem_destroy(&n->ready);
 	Assert(rv == 0); /* Fails only if sem object is invalid */
 	pg_raft_fsm_close(&n->raft_fsm);
-	// TODO dqlite does not close raft_io, shall we close it?
-	raft_uv_close(&n->raft_io);
+	/* raft_io has already been closed in pg_raft_close_cb */
 	raft_uv_tcp_close(&n->raft_transport);
 	uv_loop_close(&n->loop);
 	pg_raft_config_close(&n->config);
@@ -223,14 +234,10 @@ maybe_bootstrap(pg_raft_node *n,
 	if (rv != 0)
 	{
 		if (rv == RAFT_CANTBOOTSTRAP)
-		{
 			rv = 0;
-		}
 		else
-		{
 			snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "raft_bootstrap(): %s",
 				 raft_errmsg(&n->raft));
-		}
 	}
 
 out:
@@ -498,7 +505,7 @@ pg_raft_generate_node_id(const char *address)
 	return raft_digest(address, n);
 }
 
-int
+static int
 pg_raft_config_init(struct pg_raft_config *c, pg_raft_node_id id, const char *address)
 {
 	c->id = id;
@@ -509,7 +516,7 @@ pg_raft_config_init(struct pg_raft_config *c, pg_raft_node_id id, const char *ad
 	return 0;
 }
 
-void
+static void
 pg_raft_config_close(struct pg_raft_config *c)
 {
 	raft_free(c->address);

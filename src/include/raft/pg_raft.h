@@ -16,17 +16,6 @@ struct pg_raft_config
 };
 
 /**
- * Initialize the config object with required values and set the rest to sane
- * defaults. A copy will be made of the given @address.
- */
-int pg_raft_config_init(struct pg_raft_config *c, pg_raft_node_id id, const char *address);
-
-/**
- * Release any memory held by the config object.
- */
-void pg_raft_config_close(struct pg_raft_config *c);
-
-/**
  * A logical postgres raft node instance.
  */
 struct pg_raft_node
