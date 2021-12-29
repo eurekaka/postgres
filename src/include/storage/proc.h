@@ -153,6 +153,16 @@ struct PGPROC
 	SHM_QUEUE	syncRepLinks;	/* list link if process is in syncrep queue */
 
 	/*
+	 * Info to allow us to wait for raft replication.
+	 * raftWaitLSN is InvalidXLogRecPtr if not waiting; set only by user backend.
+	 * raftRepState must not be touched except by owning process or raftserver.
+	 * raftRepLinks used only while holding RaftRepLock.
+	 */
+	XLogRecPtr	raftWaitLSN;	/* waiting for this LSN or higher */
+	int			raftRepState;	/* wait state for raft rep */
+	SHM_QUEUE	raftRepLinks;	/* list link if process is in raftrep queue */
+
+	/*
 	 * All PROCLOCK objects for locks held or awaited by this backend are
 	 * linked into one of these lists, according to the partition number of
 	 * their lock.
@@ -285,11 +295,12 @@ extern PGPROC *PreparedXactProcs;
  * We set aside some extra PGPROC structures for auxiliary processes,
  * ie things that aren't full-fledged backends but need shmem access.
  *
- * Background writer, checkpointer and WAL writer run during normal operation.
- * Startup process and WAL receiver also consume 2 slots, but WAL writer is
- * launched only after startup has exited, so we only need 4 slots.
+ * Raft server, background writer, checkpointer and WAL writer run
+ * during normal operation.  Startup process and WAL receiver also
+ * consume 2 slots, but WAL writer is launched only after startup
+ * has exited, so we only need 5 slots.
  */
-#define NUM_AUXILIARY_PROCS		4
+#define NUM_AUXILIARY_PROCS		5
 
 /* configurable options */
 extern PGDLLIMPORT int DeadlockTimeout;

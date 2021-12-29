@@ -32,6 +32,7 @@
  */
 typedef enum
 {
+	PMSIGNAL_RAFTSERVER_READY,	/* raft server is ready */
 	PMSIGNAL_RECOVERY_STARTED,	/* recovery has started */
 	PMSIGNAL_BEGIN_HOT_STANDBY, /* begin Hot Standby */
 	PMSIGNAL_WAKEN_ARCHIVER,	/* send a NOTIFY signal to xlog archiver */

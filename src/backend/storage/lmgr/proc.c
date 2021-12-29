@@ -41,6 +41,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "replication/raftrep.h"
 #include "replication/slot.h"
 #include "replication/syncrep.h"
 #include "replication/walsender.h"
@@ -421,6 +422,11 @@ InitProcess(void)
 	MyProc->waitLSN = 0;
 	MyProc->syncRepState = SYNC_REP_NOT_WAITING;
 	SHMQueueElemInit(&(MyProc->syncRepLinks));
+
+	/* Initialize fields for raft rep */
+	MyProc->raftWaitLSN = 0;
+	MyProc->raftRepState = RAFT_REP_NOT_WAITING;
+	SHMQueueElemInit(&(MyProc->raftRepLinks));
 
 	/* Initialize fields for group XID clearing. */
 	MyProc->procArrayGroupMember = false;

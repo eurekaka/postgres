@@ -34,6 +34,7 @@
 #include "pg_getopt.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/raftserver.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
 #include "replication/walreceiver.h"
@@ -338,6 +339,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			case WalReceiverProcess:
 				statmsg = pgstat_get_backend_desc(B_WAL_RECEIVER);
 				break;
+			case RaftServerProcess:
+				statmsg = pgstat_get_backend_desc(B_RAFT_SERVER);
+				break;
 			default:
 				statmsg = "??? process";
 				break;
@@ -470,6 +474,11 @@ AuxiliaryProcessMain(int argc, char *argv[])
 		case WalReceiverProcess:
 			/* don't set signals, walreceiver has its own agenda */
 			WalReceiverMain();
+			proc_exit(1);		/* should never return */
+
+		case RaftServerProcess:
+			/* don't set signals, raftserver has its own agenda */
+			RaftServerMain();
 			proc_exit(1);		/* should never return */
 
 		default:

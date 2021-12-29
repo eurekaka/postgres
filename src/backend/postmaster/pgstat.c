@@ -2951,6 +2951,9 @@ pgstat_bestart(void)
 			case WalReceiverProcess:
 				lbeentry.st_backendType = B_WAL_RECEIVER;
 				break;
+			case RaftServerProcess:
+				lbeentry.st_backendType = B_RAFT_SERVER;
+				break;
 			default:
 				elog(FATAL, "unrecognized process type: %d",
 					 (int) MyAuxProcType);
@@ -3685,6 +3688,9 @@ pgstat_get_wait_activity(WaitEventActivity w)
 		case WAIT_EVENT_WAL_WRITER_MAIN:
 			event_name = "WalWriterMain";
 			break;
+		case WAIT_EVENT_RAFT_SERVER_MAIN:
+			event_name = "RaftServerMain";
+			break;
 			/* no default case, so that compiler will warn */
 	}
 
@@ -3860,6 +3866,9 @@ pgstat_get_wait_ipc(WaitEventIPC w)
 			break;
 		case WAIT_EVENT_SYNC_REP:
 			event_name = "SyncRep";
+			break;
+		case WAIT_EVENT_RAFT_REP:
+			event_name = "RaftRep";
 			break;
 			/* no default case, so that compiler will warn */
 	}
@@ -4312,6 +4321,9 @@ pgstat_get_backend_desc(BackendType backendType)
 			break;
 		case B_WAL_WRITER:
 			backendDesc = "walwriter";
+			break;
+		case B_RAFT_SERVER:
+			backendDesc = "raftserver";
 			break;
 	}
 

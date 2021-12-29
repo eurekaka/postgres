@@ -253,7 +253,8 @@ static pid_t StartupPID = 0,
 			AutoVacPID = 0,
 			PgArchPID = 0,
 			PgStatPID = 0,
-			SysLoggerPID = 0;
+			SysLoggerPID = 0,
+			RaftServerPID = 0;
 
 /* Startup process's status */
 typedef enum
@@ -328,8 +329,8 @@ typedef enum
 	PM_WAIT_BACKENDS,			/* waiting for live backends to exit */
 	PM_SHUTDOWN,				/* waiting for checkpointer to do shutdown
 								 * ckpt */
-	PM_SHUTDOWN_2,				/* waiting for archiver and walsenders to
-								 * finish */
+	PM_SHUTDOWN_2,				/* waiting for archiver, walsenders and
+								 * raftserver to finish */
 	PM_WAIT_DEAD_END,			/* waiting for dead_end children to exit */
 	PM_NO_CHILDREN				/* all important children have exited */
 } PMState;
@@ -377,6 +378,9 @@ static volatile sig_atomic_t WalReceiverRequested = false;
 /* set when there's a worker that needs to be started up */
 static volatile bool StartWorkerNeeded = true;
 static volatile bool HaveCrashedWorker = false;
+
+/* set when raft server has finished set up */
+static volatile bool RaftServerReady = false;
 
 #ifdef USE_SSL
 /* Set when and if SSL has been initialized properly */
@@ -550,11 +554,14 @@ static void ShmemBackendArrayAdd(Backend *bn);
 static void ShmemBackendArrayRemove(Backend *bn);
 #endif							/* EXEC_BACKEND */
 
+static void WaitRaftServerReady(void);
+
 #define StartupDataBase()		StartChildProcess(StartupProcess)
 #define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
 #define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
 #define StartWalWriter()		StartChildProcess(WalWriterProcess)
 #define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
+#define StartRaftServer()		StartChildProcess(RaftServerProcess)
 
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)
@@ -1372,6 +1379,11 @@ PostmasterMain(int argc, char *argv[])
 				 errmsg("postmaster became multithreaded during startup"),
 				 errhint("Set the LC_ALL environment variable to a valid locale.")));
 #endif
+
+	RaftServerPID = StartRaftServer();
+	Assert(RaftServerPID != 0);
+	/* Wait for raft server to become ready before launching the startup */
+	WaitRaftServerReady();
 
 	/*
 	 * Remember postmaster startup time
@@ -2679,6 +2691,7 @@ SIGHUP_handler(SIGNAL_ARGS)
 			signal_child(SysLoggerPID, SIGHUP);
 		if (PgStatPID != 0)
 			signal_child(PgStatPID, SIGHUP);
+		/* No need to signal RaftServerPID */
 
 		/* Reload authentication config files too */
 		if (!load_hba())
@@ -3044,6 +3057,8 @@ reaper(SIGNAL_ARGS)
 				 * If we have an archiver subprocess, tell it to do a last
 				 * archive cycle and quit. Likewise, if we have walsender
 				 * processes, tell them to send any remaining WAL and quit.
+				 * Similarly, ask raftserver to send the remaining raft log
+				 * and quit.
 				 */
 				Assert(Shutdown > NoShutdown);
 
@@ -3056,6 +3071,10 @@ reaper(SIGNAL_ARGS)
 				 * should be around anymore.
 				 */
 				SignalChildren(SIGUSR2);
+
+				/* Request raftserver to shutdown */
+				if (RaftServerPID != 0)
+					signal_child(RaftServerPID, SIGUSR2);
 
 				pmState = PM_SHUTDOWN_2;
 
@@ -3566,6 +3585,18 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		signal_child(WalWriterPID, (SendStop ? SIGSTOP : SIGQUIT));
 	}
 
+	/* Take care of the raftserver too */
+	if (pid == RaftServerPID)
+		RaftServerPID = 0;
+	else if (RaftServerPID != 0 && take_action)
+	{
+		ereport(DEBUG2,
+				(errmsg_internal("sending %s to process %d",
+								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
+								 (int) RaftServerPID)));
+		signal_child(RaftServerPID, (SendStop ? SIGSTOP : SIGQUIT));
+	}
+
 	/* Take care of the walreceiver too */
 	if (pid == WalReceiverPID)
 		WalReceiverPID = 0;
@@ -3768,7 +3799,10 @@ PostmasterStateMachine(void)
 			signal_child(StartupPID, SIGTERM);
 		if (WalReceiverPID != 0)
 			signal_child(WalReceiverPID, SIGTERM);
-		/* checkpointer, archiver, stats, and syslogger may continue for now */
+		/*
+		 * checkpointer, raftserver, archiver, stats, and syslogger may
+		 * continue for now
+		 */
 
 		/* Now transition to PM_WAIT_BACKENDS state to wait for them to die */
 		pmState = PM_WAIT_BACKENDS;
@@ -3790,7 +3824,7 @@ PostmasterStateMachine(void)
 		 * connected to shared memory; we also disregard dead_end children
 		 * here. Walsenders are also disregarded, they will be terminated
 		 * later after writing the checkpoint record, like the archiver
-		 * process.
+		 * process and the raftserver process.
 		 */
 		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND) == 0 &&
 			StartupPID == 0 &&
@@ -3810,9 +3844,9 @@ PostmasterStateMachine(void)
 				pmState = PM_WAIT_DEAD_END;
 
 				/*
-				 * We already SIGQUIT'd the archiver and stats processes, if
-				 * any, when we started immediate shutdown or entered
-				 * FatalError state.
+				 * We already SIGQUIT'd the archiver, raftserver and stats
+				 * processes, if any, when we started immediate shutdown
+				 * or entered FatalError state.
 				 */
 			}
 			else
@@ -3843,12 +3877,17 @@ PostmasterStateMachine(void)
 					FatalError = true;
 					pmState = PM_WAIT_DEAD_END;
 
-					/* Kill the walsenders, archiver and stats collector too */
+					/*
+					 * Kill the walsenders, archiver, raftserver and stats
+					 * collector too
+					 */
 					SignalChildren(SIGQUIT);
 					if (PgArchPID != 0)
 						signal_child(PgArchPID, SIGQUIT);
 					if (PgStatPID != 0)
 						signal_child(PgStatPID, SIGQUIT);
+					if (RaftServerPID != 0)
+						signal_child(RaftServerPID, SIGQUIT);
 				}
 			}
 		}
@@ -3859,10 +3898,12 @@ PostmasterStateMachine(void)
 		/*
 		 * PM_SHUTDOWN_2 state ends when there's no other children than
 		 * dead_end children left. There shouldn't be any regular backends
-		 * left by now anyway; what we're really waiting for is walsenders and
-		 * archiver.
+		 * left by now anyway; what we're really waiting for is walsenders,
+		 * archiver and raftserver.
 		 */
-		if (PgArchPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0)
+		if (PgArchPID == 0 &&
+			CountChildren(BACKEND_TYPE_ALL) == 0 &&
+			RaftServerPID == 0)
 		{
 			pmState = PM_WAIT_DEAD_END;
 		}
@@ -3872,10 +3913,10 @@ PostmasterStateMachine(void)
 	{
 		/*
 		 * PM_WAIT_DEAD_END state ends when the BackendList is entirely empty
-		 * (ie, no dead_end children remain), and the archiver and stats
-		 * collector are gone too.
+		 * (ie, no dead_end children remain), and the archiver, stats collector
+		 * and raftserver are gone too.
 		 *
-		 * The reason we wait for those two is to protect them against a new
+		 * The reason we wait for those three is to protect them against a new
 		 * postmaster starting conflicting subprocesses; this isn't an
 		 * ironclad protection, but it at least helps in the
 		 * shutdown-and-immediately-restart scenario.  Note that they have
@@ -3884,7 +3925,7 @@ PostmasterStateMachine(void)
 		 * FatalError processing.
 		 */
 		if (dlist_is_empty(&BackendList) &&
-			PgArchPID == 0 && PgStatPID == 0)
+			PgArchPID == 0 && PgStatPID == 0 && RaftServerPID == 0)
 		{
 			/* These other guys should be dead already */
 			Assert(StartupPID == 0);
@@ -4076,6 +4117,8 @@ TerminateChildren(int signal)
 		signal_child(BgWriterPID, signal);
 	if (CheckpointerPID != 0)
 		signal_child(CheckpointerPID, signal);
+	if (RaftServerPID != 0)
+		signal_child(RaftServerPID, signal);
 	if (WalWriterPID != 0)
 		signal_child(WalWriterPID, signal);
 	if (WalReceiverPID != 0)
@@ -5129,6 +5172,11 @@ sigusr1_handler(SIGNAL_ARGS)
 	PG_SETMASK(&BlockSig);
 #endif
 
+	if (CheckPostmasterSignal(PMSIGNAL_RAFTSERVER_READY))
+	{
+		RaftServerReady = true;
+	}
+
 	/*
 	 * RECOVERY_STARTED and BEGIN_HOT_STANDBY signals are ignored in
 	 * unexpected states. If the startup process quickly starts up, completes
@@ -5502,6 +5550,10 @@ StartChildProcess(AuxProcType type)
 				ereport(LOG,
 						(errmsg("could not fork WAL receiver process: %m")));
 				break;
+			case RaftServerProcess:
+				ereport(LOG,
+						(errmsg("could not fork raft server process: %m")));
+				break;
 			default:
 				ereport(LOG,
 						(errmsg("could not fork process: %m")));
@@ -5512,7 +5564,7 @@ StartChildProcess(AuxProcType type)
 		 * fork failure is fatal during startup, but there's no need to choke
 		 * immediately if starting other child types fails.
 		 */
-		if (type == StartupProcess)
+		if (type == StartupProcess || type == RaftServerProcess)
 			ExitPostmaster(1);
 		return 0;
 	}
@@ -6612,4 +6664,24 @@ InitPostmasterDeathWatchHandle(void)
 				(errmsg_internal("could not duplicate postmaster handle: error code %lu",
 								 GetLastError())));
 #endif							/* WIN32 */
+}
+
+/*
+ * Wait for the raft server's signal to say that it is ready
+ */
+static void
+WaitRaftServerReady(void)
+{
+	/* Postmaster does not init local latches, use a naive loop */
+	for (;;)
+	{
+		if (RaftServerReady)
+			return;
+
+		PG_SETMASK(&UnBlockSig);
+
+		pg_usleep(100000L); /* 100 msec seems reasonable */
+
+		PG_SETMASK(&BlockSig);
+	}
 }
