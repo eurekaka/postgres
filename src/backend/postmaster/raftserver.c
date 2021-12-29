@@ -87,8 +87,6 @@ RaftServerMain()
 	/* main worker loop */
 	for (;;)
 	{
-		int rc;
-
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
 
@@ -110,19 +108,10 @@ RaftServerMain()
 			(void) maybe_send_raft_log();
 		}
 
-		/*
-		 * Sleep until there's something to do
-		 */
-		rc = WaitLatch(MyLatch,
+		/* Sleep until there's something to do */
+		(void) WaitLatch(MyLatch,
 					WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
 					-1, WAIT_EVENT_RAFT_SERVER_MAIN);
-
-		if (rc & WL_EXIT_ON_PM_DEATH)
-		{
-			/* TODO: can we finish raft log sync if postmaster has gone? */
-			(void) shutdown_raft_server();
-			proc_exit(0);
-		}
 	}
 }
 

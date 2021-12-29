@@ -2907,6 +2907,33 @@ reaper(SIGNAL_ARGS)
 
 	while ((pid = waitpid(-1, &exitstatus, WNOHANG)) > 0)
 	{
+		/* Check if this child was a raftserver process */
+		if (pid == RaftServerPID)
+		{
+			RaftServerPID = 0;
+
+			if (!EXIT_STATUS_0(exitstatus))
+			{
+				/*
+				 * Unexpected exit of raftserver process (including FATAL exit)
+				 * during PM_INIT is treated as catastrophic. There are no
+				 * other processes running yet, so we can just exit.
+				 */
+				if (pmState == PM_INIT)
+				{
+					LogChildExit(LOG, _("raft server process"),
+								 pid, exitstatus);
+					ereport(LOG,
+							(errmsg("aborting startup due to raft server failure")));
+					ExitPostmaster(1);
+				}
+				/* Otherwise request a postmaster reset */
+				HandleChildCrash(pid, exitstatus, _("raft server process"));
+			}
+			/* PostmasterStateMachine logic does the rest */
+			continue;
+		}
+
 		/*
 		 * Check if this child was a startup process.
 		 */
@@ -4006,6 +4033,11 @@ PostmasterStateMachine(void)
 		LocalProcessControlFile(true);
 
 		reset_shared(PostPortNumber);
+
+		RaftServerPID = StartRaftServer();
+		Assert(RaftServerPID != 0);
+		/* Wait for raft server to become ready before launching the startup */
+		WaitRaftServerReady();
 
 		StartupPID = StartupDataBase();
 		Assert(StartupPID != 0);
