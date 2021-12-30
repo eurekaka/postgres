@@ -55,6 +55,8 @@ shmem_startup_hook_type shmem_startup_hook = NULL;
 static Size total_addin_request = 0;
 static bool addin_request_allowed = true;
 
+int32 *global_counter = 0;
+
 
 /*
  * RequestAddinShmemSpace
@@ -73,6 +75,21 @@ RequestAddinShmemSpace(Size size)
 	if (IsUnderPostmaster || !addin_request_allowed)
 		return;					/* too late */
 	total_addin_request = add_size(total_addin_request, size);
+}
+
+static void
+int32_shmem_init(void)
+{
+	bool found;
+
+	global_counter = (int32 *)
+		ShmemInitStruct("int32 global counter", sizeof(int32), &found);
+
+	if (!found)
+	{
+		/* First time through, so initialize */
+		*global_counter = 0;
+	}
 }
 
 
@@ -143,6 +160,7 @@ CreateSharedMemoryAndSemaphores(int port)
 		size = add_size(size, ReplicationOriginShmemSize());
 		size = add_size(size, WalSndShmemSize());
 		size = add_size(size, RaftWalSndShmemSize());
+		size = add_size(size, sizeof(int32));
 		size = add_size(size, WalRcvShmemSize());
 		size = add_size(size, ApplyLauncherShmemSize());
 		size = add_size(size, SnapMgrShmemSize());
@@ -256,6 +274,7 @@ CreateSharedMemoryAndSemaphores(int port)
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	RaftWalSndShmemInit();
+	int32_shmem_init();
 	WalRcvShmemInit();
 	ApplyLauncherShmemInit();
 

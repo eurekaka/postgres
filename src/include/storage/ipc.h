@@ -18,6 +18,8 @@
 #ifndef IPC_H
 #define IPC_H
 
+extern int32 *global_counter;
+
 typedef void (*pg_on_exit_callback) (int code, Datum arg);
 typedef void (*shmem_startup_hook_type) (void);
 

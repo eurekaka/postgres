@@ -829,6 +829,9 @@ ProcKill(int code, Datum arg)
 	/* Make sure we're out of the sync rep lists */
 	SyncRepCleanupAtProcExit();
 
+	/* Make sure we're out of the raft rep lists */
+	RaftRepCleanupAtProcExit();
+
 #ifdef USE_ASSERT_CHECKING
 	{
 		int			i;

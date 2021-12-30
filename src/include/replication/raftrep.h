@@ -44,5 +44,6 @@ extern void RaftRepCleanupAtProcExit(void);
 /* called by raftserver */
 extern void RaftRepInitConfig(void);
 extern void RaftRepReleaseWaiters(void);
+extern void SetRaftWalSndCtlLSN(XLogRecPtr lsn);
 
 #endif							/* _RAFTREP_H */

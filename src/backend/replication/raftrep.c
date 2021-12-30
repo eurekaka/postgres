@@ -332,6 +332,21 @@ RaftRepReleaseWaiters(void)
 	elog(DEBUG3, "released %d procs", num);
 }
 
+void
+SetRaftWalSndCtlLSN(XLogRecPtr lsn)
+{
+	/* TODO: do we really need locking for lsn update? */
+	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
+
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	walsndctl->lsn = lsn;
+
+	LWLockRelease(RaftRepLock);
+
+	elog(DEBUG3, "update RaftWalSndCtl->lsn to %X/%X",
+			(uint32) (lsn >> 32), (uint32) lsn);
+}
+
 /*
  * Walk the wait queue from head.  Set the state of any backends that
  * need to be woken, remove them from the queue, and then wake them.

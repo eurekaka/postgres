@@ -193,4 +193,8 @@ pg_raft_node_id pg_raft_generate_node_id(const char *address);
 void pg_raft_cluster_config_init(pg_raft_node *n,
 								pg_raft_node_id *ids, char **addrs);
 
+int pg_raft_node_apply_log(pg_raft_node *n, void *data, size_t len);
+
+bool pg_raft_node_is_leader(pg_raft_node *n);
+
 #endif /* _PG_RAFT_H */

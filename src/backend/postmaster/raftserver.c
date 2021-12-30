@@ -30,7 +30,6 @@
 int raft_server_id;
 
 static char *raft_log_directory = "raft_log";
-
 static pg_raft_node *raft_node = NULL;
 
 static pg_raft_node_id raft_cluster_ids[] = {0, 1, 2};
@@ -40,17 +39,15 @@ static char *raft_cluster_addrs[] = {\
 "127.0.0.1:5002"\
 };
 
-static volatile sig_atomic_t check_requested = false;
 static volatile sig_atomic_t shutdown_requested = false;
 
 static void raftserver_sigusr1_handler(SIGNAL_ARGS);
 static void raftserver_shutdown_handler(SIGNAL_ARGS);
-static void raftserver_check_handler(SIGNAL_ARGS);
 static void raftserver_quickdie(SIGNAL_ARGS);
 
 static void shutdown_raft_server(void);
 static void start_raft_server(void);
-static int maybe_send_raft_log(void);
+static void maybe_apply_raft_log(void);
 
 /*
  * Main entry point for raftserver process
@@ -68,7 +65,7 @@ RaftServerMain()
 	 * down (via SIGUSR2).
 	 */
 	pqsignal(SIGHUP, SIG_IGN);
-	pqsignal(SIGINT, raftserver_check_handler);
+	pqsignal(SIGINT, SIG_IGN);
 	pqsignal(SIGTERM, SIG_IGN); /* ignore SIGTERM */
 	pqsignal(SIGQUIT, raftserver_quickdie); /* hard crash time */
 	pqsignal(SIGALRM, SIG_IGN);
@@ -108,22 +105,18 @@ RaftServerMain()
 		if (shutdown_requested)
 		{
 			/* Finish sync of the remaining raft logs */
-			(void) maybe_send_raft_log();
+			maybe_apply_raft_log();
 			shutdown_raft_server();
 			/* Normal exit from the raftserver is here */
 			proc_exit(0);
 		}
 
-		if (check_requested)
-		{
-			check_requested = false;
-			(void) maybe_send_raft_log();
-		}
+		maybe_apply_raft_log();
 
 		/* Sleep until there's something to do */
 		(void) WaitLatch(MyLatch,
-					WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
-					-1, WAIT_EVENT_RAFT_SERVER_MAIN);
+					WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+					100, WAIT_EVENT_RAFT_SERVER_MAIN);
 	}
 }
 
@@ -169,10 +162,30 @@ shutdown_raft_server(void)
 	pg_raft_node_destroy(raft_node);
 }
 
-static int
-maybe_send_raft_log(void)
+static int32 saved_global_counter = 0;
+
+static void
+maybe_apply_raft_log(void)
 {
-	return 0;
+	int rv = 0;
+	uint64_t log;
+	if (!pg_raft_node_is_leader(raft_node))
+		return;
+	if (saved_global_counter != *global_counter)
+	{
+		saved_global_counter = *global_counter;
+
+		log = (uint64_t) saved_global_counter;
+		rv = pg_raft_node_apply_log(raft_node, &log, sizeof(log));
+		if (rv != 0)
+			ereport(LOG,
+					(errmsg("maybe_apply_raft_log failed (%d), \
+					error msg %s", rv, pg_raft_node_errmsg(raft_node))));
+		else
+			ereport(LOG,
+					(errmsg("finished apply log %ld", log)));
+	}
+	return;
 }
 
 /* --------------------------------
@@ -198,18 +211,6 @@ raftserver_shutdown_handler(SIGNAL_ARGS)
 	int save_errno = errno;
 
 	shutdown_requested = true;
-	SetLatch(MyLatch);
-
-	errno = save_errno;
-}
-
-/* SIGINT: check if new raft logs need sync. */
-static void
-raftserver_check_handler(SIGNAL_ARGS)
-{
-	int save_errno = errno;
-
-	check_requested = true;
 	SetLatch(MyLatch);
 
 	errno = save_errno;

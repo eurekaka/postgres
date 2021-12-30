@@ -2,6 +2,8 @@
 
 #include <inttypes.h>
 #include "raft/pg_raft.h"
+#include "replication/raftrep.h"
+#include "storage/ipc.h"
 #include "utils/ps_status.h"
 
 /* Special ID for the bootstrap node. Equals to raft_digest("1", 0). */
@@ -559,6 +561,71 @@ pg_raft_state_string(int state)
 	return "unexpected state";
 }
 
+static void
+pg_raft_node_apply_log_cb(struct raft_apply *req, int status, void *result)
+{
+	pg_raft_node *n = req->data;
+	raft_free(req);
+	if (status != 0)
+	{
+		tracef("pg_raft_node_apply_log_cb: %s (%d)",
+				raft_errmsg(&n->raft), status);
+		return;
+	}
+	SetRaftWalSndCtlLSN(FirstNormalUnloggedLSN);
+	RaftRepReleaseWaiters();
+}
+
+int
+pg_raft_node_apply_log(pg_raft_node *n, void *data, size_t len)
+{
+	int rv;
+	struct raft_buffer buf;
+	struct raft_apply *req;
+
+	if (n->raft_state != RAFT_LEADER)
+	{
+		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "pg_raft_node_apply_log: \
+					not leader");
+		return 1;
+	}
+
+	buf.len = len;
+	buf.base = raft_malloc(buf.len);
+	if (buf.base == NULL)
+	{
+		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "pg_raft_node_apply_log: \
+					out of memory");
+		return 1;
+	}
+	memcpy(buf.base, data, len);
+
+	req = raft_malloc(sizeof(*req));
+	if (req == NULL)
+	{
+		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "pg_raft_node_apply_log: \
+					out of memory");
+		return 1;
+	}
+	req->data = n;
+
+	rv = raft_apply(&n->raft, req, &buf, 1, pg_raft_node_apply_log_cb);
+	if (rv != 0)
+	{
+		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "raft_apply: %s", \
+					raft_errmsg(&n->raft));
+		return rv;
+	}
+
+	return 0;
+}
+
+bool
+pg_raft_node_is_leader(pg_raft_node *n)
+{
+	return (n->raft_state == RAFT_LEADER);
+}
+
 struct pg_raft_fsm
 {
 	unsigned long long count;
@@ -572,6 +639,7 @@ pg_raft_fsm_apply(struct raft_fsm *fsm,
 	if (buf->len != sizeof(uint64_t))
 		return RAFT_MALFORMED;
 	f->count = *(uint64_t *)buf->base;
+	*global_counter = (int32) f->count;
 	*result = &f->count;
 	return 0;
 }
@@ -600,6 +668,7 @@ pg_raft_fsm_restore(struct raft_fsm *fsm, struct raft_buffer *buf)
 	if (buf->len != sizeof(uint64_t))
 		return RAFT_MALFORMED;
 	f->count = *(uint64_t *)buf->base;
+	*global_counter = (int32) f->count;
 	// TODO normally the snapshot and restore happens on different nodes,
 	// we may need another pair of free / malloc?
 	raft_free(buf->base);
@@ -612,7 +681,7 @@ pg_raft_fsm_init(struct raft_fsm *fsm)
 	struct pg_raft_fsm *f = raft_malloc(sizeof *f);
 	if (f == NULL)
 		return RAFT_NOMEM;
-	f->count = 0;
+	f->count = (unsigned long long) *global_counter;
 	fsm->version = 1;
 	fsm->data = f;
 	fsm->apply = pg_raft_fsm_apply;
