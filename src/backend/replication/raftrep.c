@@ -160,8 +160,12 @@ RaftRepWaitForLSN(XLogRecPtr lsn)
 		{
 			ereport(WARNING,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
-					 errmsg("canceling the wait for raft replication and terminating connection due to administrator command"),
-					 errdetail("The transaction has already committed locally, but might not have been replicated to other raft servers.")));
+					 errmsg("canceling the wait for raft replication and \
+							terminating connection due to administrator \
+							command"),
+					 errdetail("The transaction has already committed locally, \
+								but might not have been replicated to other \
+								raft servers.")));
 			whereToSendOutput = DestNone;
 			RaftRepCancelWait();
 			break;
@@ -177,8 +181,11 @@ RaftRepWaitForLSN(XLogRecPtr lsn)
 		{
 			QueryCancelPending = false;
 			ereport(WARNING,
-					(errmsg("canceling wait for raft replication due to user request"),
-					 errdetail("The transaction has already committed locally, but might not have been replicated to other raft servers.")));
+					(errmsg("canceling wait for raft replication \
+								due to user request"),
+					 errdetail("The transaction has already committed locally, \
+								but might not have been replicated to other \
+								raft servers.")));
 			RaftRepCancelWait();
 			break;
 		}

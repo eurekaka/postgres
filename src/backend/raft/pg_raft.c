@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include "raft/pg_raft.h"
+#include "utils/ps_status.h"
 
 /* Special ID for the bootstrap node. Equals to raft_digest("1", 0). */
 #define BOOTSTRAP_ID 0x2dc171858c3155be
@@ -49,6 +50,8 @@ static int pg_raft_config_init(struct pg_raft_config *c,
  */
 static void pg_raft_config_close(struct pg_raft_config *c);
 
+static char *pg_raft_state_string(int state);
+
 static int pg_raft_fsm_init(struct raft_fsm *fsm);
 static void pg_raft_fsm_close(struct raft_fsm *f);
 
@@ -86,10 +89,12 @@ pg_raft_node_init(struct pg_raft_node *n,
 
 	/* Initialize and start the engine, using the libuv-based I/O backend. */
 	/* TODO: add clean up for raft_init if this function fails later? */
-	rv = raft_init(&n->raft, &n->raft_io, &n->raft_fsm, n->config.id, n->config.address);
+	rv = raft_init(&n->raft, &n->raft_io,
+				&n->raft_fsm, n->config.id, n->config.address);
 	if (rv != 0)
 	{
-		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE, "raft_init(): %s", raft_errmsg(&n->raft));
+		snprintf(n->errmsg, RAFT_ERRMSG_BUF_SIZE,
+				"raft_init(): %s", raft_errmsg(&n->raft));
 		goto err_after_raft_fsm_init;
 	}
 	n->raft.data = n;
@@ -294,6 +299,7 @@ pg_raft_monitor_cb(uv_prepare_t *monitor)
 		return;
 
 	n->raft_state = state;
+	set_ps_display(pg_raft_state_string(state), false);
 }
 
 static int
@@ -306,8 +312,8 @@ task_run(struct pg_raft_node *n)
 	rv = uv_async_init(&n->loop, &n->stop, pg_raft_stop_cb);
 	Assert(rv == 0);
 
-	/* Schedule pg_raft_startup_cb to be fired as soon as the loop starts. It will
-	 * unblock task_ready in the main thread. */
+	/* Schedule pg_raft_startup_cb to be fired as soon as the loop starts. It
+	 * will unblock task_ready in the main thread. */
 	n->startup.data = n;
 	rv = uv_timer_init(&n->loop, &n->startup);
 	Assert(rv == 0);
@@ -507,7 +513,8 @@ pg_raft_generate_node_id(const char *address)
 }
 
 static int
-pg_raft_config_init(struct pg_raft_config *c, pg_raft_node_id id, const char *address)
+pg_raft_config_init(struct pg_raft_config *c,
+			pg_raft_node_id id, const char *address)
 {
 	c->id = id;
 	c->address = raft_malloc((int)strlen(address) + 1);
@@ -535,13 +542,31 @@ pg_raft_cluster_config_init(pg_raft_node *n,
 	}
 }
 
+static char *
+pg_raft_state_string(int state)
+{
+	switch (state)
+	{
+		case RAFT_UNAVAILABLE:
+			return "unavailable state";
+		case RAFT_FOLLOWER:
+			return "follower state";
+		case RAFT_CANDIDATE:
+			return "candidate state";
+		case RAFT_LEADER:
+			return "leader state";
+	}
+	return "unexpected state";
+}
+
 struct pg_raft_fsm
 {
 	unsigned long long count;
 };
 
 static int
-pg_raft_fsm_apply(struct raft_fsm *fsm, const struct raft_buffer *buf, void **result)
+pg_raft_fsm_apply(struct raft_fsm *fsm,
+				const struct raft_buffer *buf, void **result)
 {
 	struct pg_raft_fsm *f = fsm->data;
 	if (buf->len != sizeof(uint64_t))
@@ -552,7 +577,8 @@ pg_raft_fsm_apply(struct raft_fsm *fsm, const struct raft_buffer *buf, void **re
 }
 
 static int
-pg_raft_fsm_snapshot(struct raft_fsm *fsm, struct raft_buffer *bufs[], unsigned *n_bufs)
+pg_raft_fsm_snapshot(struct raft_fsm *fsm,
+			struct raft_buffer *bufs[], unsigned *n_bufs)
 {
 	struct pg_raft_fsm *f = fsm->data;
 	*n_bufs = 1;
