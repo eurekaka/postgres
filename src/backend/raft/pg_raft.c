@@ -213,23 +213,21 @@ pg_raft_node_set_snapshot_params(pg_raft_node *n,
 }
 
 static int
-maybe_bootstrap(pg_raft_node *n,
-			pg_raft_node_id id,
-			const char *address)
+pg_raft_bootstrap(pg_raft_node *n)
 {
 	int rv;
 	struct raft_configuration configuration;
 
-	if (id != 1 && id != BOOTSTRAP_ID)
-		return 0;
-
 	/* Bootstrap the initial configuration. */
 	raft_configuration_init(&configuration);
-	rv = raft_configuration_add(&configuration, id, address, RAFT_VOTER);
-	if (rv != 0)
-		goto out;
+	for (int i = 0; i < FIXED_RAFT_CLUSTER_SIZE; i++)
+	{
+		rv = raft_configuration_add(&configuration, n->cluster_conf.ids[i],
+									n->cluster_conf.addrs[i], RAFT_VOTER);
+		if (rv != 0)
+			goto out;
+	}
 
-	// TODO: only one node in the configuration?
 	rv = raft_bootstrap(&n->raft, &configuration);
 	if (rv != 0)
 	{
@@ -383,18 +381,21 @@ task_ready(struct pg_raft_node *n)
 }
 
 int
-pg_raft_node_start(pg_raft_node *n)
+pg_raft_node_start(pg_raft_node *n, bool bootstrap)
 {
 	int rv;
 
 	/* Enable tracing if PG_RAFT_TRACE env is specified. */
 	pg_raft_tracing_maybe_enable(true);
 	tracef("postgres raft node start");
-	rv = maybe_bootstrap(n, n->config.id, n->config.address);
-	if (rv != 0)
+	if (bootstrap)
 	{
-		tracef("raft bootstrap failed %d", rv);
-		goto err;
+		rv = pg_raft_bootstrap(n);
+		if (rv != 0)
+		{
+			tracef("raft bootstrap failed %d", rv);
+			goto err;
+		}
 	}
 
 	rv = pthread_create(&n->thread, 0, &task_start, n);
@@ -520,6 +521,18 @@ static void
 pg_raft_config_close(struct pg_raft_config *c)
 {
 	raft_free(c->address);
+}
+
+/* TODO: remove this, and use raft_add instead. */
+void
+pg_raft_cluster_config_init(pg_raft_node *n,
+							pg_raft_node_id *ids, char **addrs)
+{
+	for (int i = 0; i < FIXED_RAFT_CLUSTER_SIZE; i++)
+	{
+		n->cluster_conf.ids[i] = ids[i];
+		n->cluster_conf.addrs[i] = addrs[i];
+	}
 }
 
 struct pg_raft_fsm

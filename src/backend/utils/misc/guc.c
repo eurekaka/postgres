@@ -63,6 +63,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/raftserver.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walwriter.h"
 #include "replication/logicallauncher.h"
@@ -3192,6 +3193,17 @@ static struct config_int ConfigureNamesInt[] =
 		&tcp_user_timeout,
 		0, 0, INT_MAX,
 		NULL, assign_tcp_user_timeout, show_tcp_user_timeout
+	},
+
+	{
+		{"raft_server_id", PGC_POSTMASTER, REPLICATION,
+			gettext_noop("The unique instance ID for the raft server."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&raft_server_id,
+		INT_MAX, 0, INT_MAX,
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */

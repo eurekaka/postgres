@@ -26,13 +26,19 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 
-/*
- * TODO: GUC parameters.  Logging_collector cannot be changed after postmaster
- * start, but the rest can change at SIGHUP.
- */
-char *Raft_log_directory = "raft_log";
+/* GUC parameter, cannot be changed after postmaster start */
+int raft_server_id;
+
+static char *raft_log_directory = "raft_log";
 
 static pg_raft_node *raft_node = NULL;
+
+static pg_raft_node_id raft_cluster_ids[] = {0, 1, 2};
+static char *raft_cluster_addrs[] = {\
+"127.0.0.1:5000",\
+"127.0.0.1:5001",\
+"127.0.0.1:5002"\
+};
 
 static volatile sig_atomic_t check_requested = false;
 static volatile sig_atomic_t shutdown_requested = false;
@@ -75,8 +81,11 @@ RaftServerMain()
 	/* Unblock SIGQUIT as soon as possible */
 	sigdelset(&BlockSig, SIGQUIT);
 
+	if (raft_server_id == INT_MAX)
+		proc_exit(0);
+
 	/* Create raft log directory if not present; ignore errors */
-	(void) MakePGDirectory(Raft_log_directory);
+	(void) MakePGDirectory(raft_log_directory);
 
 	RaftRepInitConfig();
 	start_raft_server();
@@ -119,6 +128,34 @@ RaftServerMain()
 }
 
 static void
+start_raft_server(void)
+{
+	int rc = 0;
+
+	if (raft_server_id > 2)
+		ereport(FATAL,
+				(errmsg("invalid raft_server_id value %d", raft_server_id)));
+
+	rc = pg_raft_node_create((pg_raft_node_id) raft_cluster_ids[raft_server_id],
+							raft_cluster_addrs[raft_server_id],
+							raft_log_directory, &raft_node);
+	if (rc != 0)
+		ereport(FATAL,
+				(errmsg("pg_raft_node_create failed with return code %d", rc)));
+
+	/* Pass down the hard-coded raft cluster config for bootstrap */
+	pg_raft_cluster_config_init(raft_node,
+								raft_cluster_ids,
+								raft_cluster_addrs);
+
+	rc = pg_raft_node_start(raft_node, true);
+	if (rc != 0)
+		ereport(FATAL,
+				(errmsg("pg_raft_node_start failed with return code %d, \
+				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
+}
+
+static void
 shutdown_raft_server(void)
 {
 	int rc = 0;
@@ -130,24 +167,6 @@ shutdown_raft_server(void)
 				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
 
 	pg_raft_node_destroy(raft_node);
-}
-
-static void
-start_raft_server(void)
-{
-	int rc = 0;
-
-	rc = pg_raft_node_create((pg_raft_node_id) 1,
-							"127.0.0.1:5000", Raft_log_directory, &raft_node);
-	if (rc != 0)
-		ereport(FATAL,
-				(errmsg("pg_raft_node_create failed with return code %d", rc)));
-
-	rc = pg_raft_node_start(raft_node);
-	if (rc != 0)
-		ereport(FATAL,
-				(errmsg("pg_raft_node_start failed with return code %d, \
-				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
 }
 
 static int

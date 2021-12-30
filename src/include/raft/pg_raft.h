@@ -1,5 +1,5 @@
-#ifndef PG_RAFT_H
-#define PG_RAFT_H
+#ifndef _PG_RAFT_H
+#define _PG_RAFT_H
 
 #include <raft.h>
 #include <raft/uv.h>
@@ -13,6 +13,14 @@ struct pg_raft_config
 {
 	pg_raft_node_id id;            /* Unique instance ID */
 	char *address;                 /* Instance address */
+};
+
+/* TODO: remove this, and use raft_add instead. */
+#define FIXED_RAFT_CLUSTER_SIZE 3
+struct pg_raft_cluster_config
+{
+	pg_raft_node_id ids[FIXED_RAFT_CLUSTER_SIZE];
+	char *addrs[FIXED_RAFT_CLUSTER_SIZE];
 };
 
 /**
@@ -35,6 +43,9 @@ struct pg_raft_node
 	struct uv_prepare_s monitor;             /* Raft state change monitor */
 	int raft_state;                          /* Previous raft state */
 	char errmsg[RAFT_ERRMSG_BUF_SIZE];       /* Last error occurred */
+
+	/* TODO: remove this, and use raft_add instead. */
+	struct pg_raft_cluster_config cluster_conf;
 };
 
 typedef struct pg_raft_node pg_raft_node;
@@ -121,7 +132,7 @@ int pg_raft_node_set_snapshot_params(pg_raft_node *n,
  * this function returns successfully, the postgres raft node is ready to accept new
  * connections from other raft nodes.
  */
-int pg_raft_node_start(pg_raft_node *n);
+int pg_raft_node_start(pg_raft_node *n, bool bootstrap);
 
 /**
  * Stop a logical postgres raft node.
@@ -178,4 +189,8 @@ const char *pg_raft_node_errmsg(pg_raft_node *n);
  */
 pg_raft_node_id pg_raft_generate_node_id(const char *address);
 
-#endif /* PG_RAFT_H */
+/* TODO: remove this, and use raft_add instead. */
+void pg_raft_cluster_config_init(pg_raft_node *n,
+								pg_raft_node_id *ids, char **addrs);
+
+#endif /* _PG_RAFT_H */
