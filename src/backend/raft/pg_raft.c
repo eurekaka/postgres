@@ -109,7 +109,7 @@ pg_raft_node_init(struct pg_raft_node *n,
 	raft_set_snapshot_trailing(&n->raft, 128);
 	raft_set_max_catch_up_rounds(&n->raft, 100);
 	raft_set_max_catch_up_round_duration(&n->raft, 50 * 1000); /* 50 secs */
-	raft_set_pre_vote(&n->raft, true);
+	raft_set_pre_vote(&n->raft, false);
 
 	/* Initialize semephore used to sync between raft thread and main thread. */
 	// TODO pg_sem?
