@@ -24,9 +24,19 @@
 /* Pointer of the global raft xlog sync state in shared memory */
 RaftWalSndCtlData *RaftWalSndCtl = NULL;
 
+/* State for RaftWalSndWakeupRequest */
+bool wakeup_raft_server = false;
+
+/* Variables used by RaftRepXLogRead to track the reading progress */
+static int sendFile = -1;
+static XLogSegNo sendSegNo = 0;
+static uint32 sendOff = 0;
+
 static void RaftRepQueueInsert(void);
 static void RaftRepCancelWait(void);
-static int	RaftRepWakeQueue(bool all);
+static int RaftRepWakeQueue(bool all);
+static void RaftRepDestroy(void);
+static void RaftRepXLogRead(char *buf, XLogRecPtr startPtr, Size count);
 
 #ifdef USE_ASSERT_CHECKING
 static bool RaftRepQueueIsOrderedByLSN(void);
@@ -91,7 +101,7 @@ RaftRepWaitForLSN(XLogRecPtr lsn)
 	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
 	Assert(MyProc->raftRepState == RAFT_REP_NOT_WAITING);
 
-	if (lsn <= RaftWalSndCtl->lsn)
+	if (lsn <= RaftWalSndCtl->committedRecEnd)
 	{
 		LWLockRelease(RaftRepLock);
 		return;
@@ -298,6 +308,18 @@ RaftRepCleanupAtProcExit(void)
 	}
 }
 
+void
+RaftRepServerWakeup(void)
+{
+	Latch *latch;
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	Assert(walsndctl != NULL);
+
+	latch = walsndctl->latch;
+	if (latch != NULL)
+		SetLatch(latch);
+}
+
 /*
  * ===========================================================
  * Raft Replication functions for raftserver auxiliary process
@@ -305,13 +327,35 @@ RaftRepCleanupAtProcExit(void)
  */
 
 /*
- * Take any action required to initialise raft rep state from config
- * data. Called at raftserver startup.
+ * Take any action required to initialise raft rep state. Called
+ * at raftserver startup.
  */
 void
-RaftRepInitConfig(void)
+RaftRepInit(void)
 {
 	/* TODO: init the raft server list and id here */
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	Assert(walsndctl != NULL);
+
+	/* No lock needed since we are in startup stage */
+	walsndctl->sentRecEnd = InvalidXLogRecPtr;
+	walsndctl->committedRecEnd = InvalidXLogRecPtr;
+	walsndctl->latch = &MyProc->procLatch;
+
+	on_shmem_exit(RaftRepDestroy, 0);
+}
+
+static void
+RaftRepDestroy(void)
+{
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	Assert(walsndctl != NULL);
+
+	/* No lock needed since we are shutting down */
+	walsndctl->sentRecEnd = InvalidXLogRecPtr;
+	walsndctl->committedRecEnd = InvalidXLogRecPtr;
+	walsndctl->latch = NULL;
+	RaftValSndCtl = NULL;
 }
 
 /*
@@ -329,22 +373,7 @@ RaftRepReleaseWaiters(void)
 
 	LWLockRelease(RaftRepLock);
 
-	elog(DEBUG3, "released %d procs", num);
-}
-
-void
-SetRaftWalSndCtlLSN(XLogRecPtr lsn)
-{
-	/* TODO: do we really need locking for lsn update? */
-	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
-
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
-	walsndctl->lsn = lsn;
-
-	LWLockRelease(RaftRepLock);
-
-	elog(DEBUG3, "update RaftWalSndCtl->lsn to %X/%X",
-			(uint32) (lsn >> 32), (uint32) lsn);
+	elog(LOG, "released %d procs", num);
 }
 
 /*
@@ -374,7 +403,7 @@ RaftRepWakeQueue(bool all)
 		/*
 		 * Assume the queue is ordered by LSN
 		 */
-		if (!all && walsndctl->lsn < proc->raftWaitLSN)
+		if (!all && walsndctl->committedRecEnd < proc->raftWaitLSN)
 			return numprocs;
 
 		/*
@@ -413,6 +442,246 @@ RaftRepWakeQueue(bool all)
 	}
 
 	return numprocs;
+}
+
+void
+RaftRepSetCommittedRecEnd(XLogRecPtr lsn)
+{
+	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
+
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	walsndctl->committedRecEnd = lsn;
+
+	LWLockRelease(RaftRepLock);
+
+	elog(LOG, "update RaftWalSndCtl->committedRecEnd to %X/%X",
+			(uint32) (lsn >> 32), (uint32) lsn);
+}
+
+void
+RaftRepInitRecEnd(XLogRecPtr lsn)
+{
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+
+	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
+	walsndctl->committedRecEnd = lsn;
+	LWLockRelease(RaftRepLock);
+
+	walsndctl->sentRecEnd = lsn;
+	elog(LOG, "init RaftWalSndCtl->sentRecEnd to %X/%X",
+			(uint32) (lsn >> 32), (uint32) lsn);
+}
+
+/*
+ * Maximum WAL data payload in a raft message.  Must be >= XLOG_BLCKSZ.
+ *
+ * We don't have a good idea of what a good value would be; there's some
+ * overhead per message in raftserver, but on the other hand sending large
+ * batches may not fully utilize the raft majority quorum settings.
+ * 128kB (with default 8k blocks) seems like a reasonable guess for now.
+ */
+#define MAX_RAFT_SEND_SIZE (XLOG_BLCKSZ * 16)
+
+static inline void
+encodeRecPtr(StringInfo buf, XLogRecPtr lsn)
+{
+	uint64 ni = pg_hton64((uint64) lsn);
+	enlargeStringInfo(buf, sizeof(ni));
+	memcpy((char *) (buf->data + buf->len), &ni, sizeof(ni));
+	buf->len += sizeof(ni);
+}
+
+/*
+ * Read 'count' bytes from WAL into 'buf', starting at location 'startPtr'
+ *
+ * Will open, and keep open, one WAL segment stored in the global file
+ * descriptor sendFile. This means if XLogRead is used once, there will
+ * always be one descriptor left open until the process ends, but never
+ * more than one.
+ */
+static void
+RaftRepXLogRead(char *buf, XLogRecPtr startPtr, Size count)
+{
+	char	   *p;
+	XLogRecPtr	recPtr;
+	Size		nbytes;
+	XLogSegNo	segno;
+
+	p = buf;
+	recPtr = startPtr;
+	nbytes = count;
+
+	while (nbytes > 0)
+	{
+		uint32		startOff;
+		int			segBytes;
+		int			readBytes;
+
+		startOff = XLogSegmentOffset(recPtr, wal_segment_size);
+
+		if (sendFile < 0 || !XLByteInSeg(recPtr, sendSegNo, wal_segment_size))
+		{
+			char path[MAXPGPATH];
+
+			/* Switch to a new WAL segment */
+			if (sendFile >= 0)
+				close(sendFile);
+
+			XLByteToSeg(recPtr, sendSegNo, wal_segment_size);
+
+			/* We does not consider timeline switch now, i.e, PITR does not
+			 * work when using raft replication */
+			XLogFilePath(path, ThisTimeLineID, sendSegNo, wal_segment_size);
+
+			sendFile = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+			if (sendFile < 0)
+			{
+				/*
+				 * If the file is not found, i.e, the WAL segment has been
+				 * removed or recycled before we replicate it, panic to
+				 * transfer the leadership to other servers. Normally
+				 * this should not happen.
+				 */
+				if (errno == ENOENT)
+					ereport(PANIC,
+							(errcode_for_file_access(),
+							 errmsg("requested WAL segment %s has already been removed",
+									XLogFileNameP(ThisTimeLineID, sendSegNo))));
+				else
+					ereport(PANIC,
+							(errcode_for_file_access(),
+							 errmsg("could not open file \"%s\": %m",
+									path)));
+			}
+			sendOff = 0;
+		}
+
+		/* Need to seek in the file? */
+		if (sendOff != startOff)
+		{
+			if (lseek(sendFile, (off_t) startOff, SEEK_SET) < 0)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("could not seek in log segment %s to offset %u: %m",
+								XLogFileNameP(ThisTimeLineID, sendSegNo),
+								startOff)));
+			sendOff = startOff;
+		}
+
+		/* How many bytes are within this segment? */
+		if (nbytes > (wal_segment_size - startOff))
+			segBytes = wal_segment_size - startOff;
+		else
+			segBytes = nbytes;
+
+		readBytes = read(sendFile, p, segBytes);
+		if (readBytes < 0)
+		{
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not read from log segment %s, offset %u, length %zu: %m",
+							XLogFileNameP(ThisTimeLineID, sendSegNo),
+							sendOff, (Size) segBytes)));
+		}
+		else if (readBytes == 0)
+		{
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read from log segment %s, offset %u: read %d of %zu",
+							XLogFileNameP(ThisTimeLineID, sendSegNo),
+							sendOff, readBytes, (Size) segBytes)));
+		}
+
+		/* Update state for read */
+		recPtr += readBytes;
+		sendOff += readBytes;
+		nbytes -= readBytes;
+		p += readBytes;
+	}
+
+	/*
+	 * After reading into the buffer, check that what we read was valid. We do
+	 * this after reading, because even though the segment was present when we
+	 * opened it, it might get recycled or removed while we read it. The
+	 * read() succeeds in that case, but the data we tried to read might
+	 * already have been overwritten with new WAL records.
+	 */
+	XLByteToSeg(startPtr, segno, wal_segment_size);
+	/* EUREKA TODO: catch the error and panic? */
+	CheckXLogRemoved(segno, ThisTimeLineID);
+}
+
+bool
+RaftRepGetRecordsForSend(XLogRecPtr lsn, StringInfo buf)
+{
+	Size nbytes;
+	XLogRecPtr sentRecEnd, startPtr, endPtr;
+	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+
+	if (XLogRecPtrIsInvalid(lsn))
+		return false;
+
+	/* No lock needed for sentRecEnd, since it is only accessed by this
+	 * this function, called in the main thread of raftserver */
+	sentRecEnd = walsndctl.sentRecEnd;
+	if (XLogRecPtrIsInvalid(sentRecEnd))
+		return false;
+	Assert(sentRecEnd <= lsn);
+
+	/* No more xlog record to send */
+	if (lsn == sentRecEnd)
+		return false;
+
+	/*
+	 * Figure out how much to send in one RPC. If there's no more than
+	 * MAX_RAFT_SEND_SIZE bytes to send, send everything. Otherwise send
+	 * MAX_RAFT_SEND_SIZE bytes, but round back to logfile or page boundary.
+	 *
+	 * The rounding is not only for performance reasons. raftserver relies on
+	 * the fact that we never split a WAL record across two RPCs. Since a
+	 * long WAL record is split at page boundary into continuation records,
+	 * page boundary is always a safe cut-off point. We also assume that
+	 * passed in target lsn never points to the middle of a WAL record.
+	 */
+	startPtr = sentRecEnd;
+	endPtr = startPtr + MAX_RAFT_SEND_SIZE;
+
+	/* if we went beyond taget lsn, back off */
+	if (lsn <= endPtr)
+		endPtr = lsn;
+	else
+		/* round down to page boundary. */
+		endPtr -= (endPtr % XLOG_BLCKSZ);
+
+	nbytes = endPtr - startPtr;
+	Assert(nbytes <= MAX_RAFT_SEND_SIZE && nbytes > 0);
+
+	/* OK to read and send the xlog records */
+	resetStringInfo(buf);
+	/* Include the start / end+1 lsn of the xlog record in the message */
+	encodeRecPtr(buf, startPtr);
+	encodeRecPtr(buf, endPtr);
+
+	/* Read the xlog directly into the buffer to avoid extra memcpy calls */
+	enlargeStringInfo(buf, nbytes);
+	RaftRepXLogRead(&buf->data[buf->len], startPtr, nbytes);
+	buf->len += nbytes;
+	buf->data[buf->len] = '\0';
+
+	/* Update shared memory status, no lock needed */
+	walsndctl->sentRecEnd = endPtr;
+
+	/* Report progress of XLOG streaming in PS display */
+	if (update_process_title)
+	{
+		char activitymsg[50];
+
+		snprintf(activitymsg, sizeof(activitymsg), "sending %X/%X",
+				 (uint32) (endPtr >> 32), (uint32) endPtr);
+		set_ps_display(activitymsg, false);
+	}
+
+	return true;
 }
 
 #ifdef USE_ASSERT_CHECKING

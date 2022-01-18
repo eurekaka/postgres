@@ -24,7 +24,6 @@
 #include "pgstat.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/postmaster.h"
-#include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
@@ -923,25 +922,6 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 	tuplestore_donestoring(tupstore);
 
 	return (Datum) 0;
-}
-
-
-Datum
-get_raft_counter(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT32(*global_counter);
-}
-
-
-Datum
-set_raft_counter(PG_FUNCTION_ARGS)
-{
-	int32 cnt = PG_GETARG_INT32(0);
-
-	*global_counter = cnt;
-	RaftRepWaitForLSN(FirstNormalUnloggedLSN);
-
-	PG_RETURN_INT32(cnt);
 }
 
 

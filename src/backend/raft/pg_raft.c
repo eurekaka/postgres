@@ -3,7 +3,6 @@
 #include <inttypes.h>
 #include "raft/pg_raft.h"
 #include "replication/raftrep.h"
-#include "storage/ipc.h"
 #include "utils/ps_status.h"
 
 /* Special ID for the bootstrap node. Equals to raft_digest("1", 0). */
@@ -40,14 +39,14 @@ pg_raft_tracing_maybe_enable(bool enable)
 #define PTR_TO_UINT64(p) ((uint64_t)((uintptr_t)(p)))
 #define UINT64_TO_PTR(u, ptr_type) ((ptr_type)((uintptr_t)(u)))
 
-/**
+/*
  * Initialize the config object with required values and set the rest to sane
  * defaults. A copy will be made of the given @address.
  */
 static int pg_raft_config_init(struct pg_raft_config *c,
 								pg_raft_node_id id, const char *address);
 
-/**
+/*
  * Release any memory held by the config object.
  */
 static void pg_raft_config_close(struct pg_raft_config *c);
@@ -564,15 +563,18 @@ pg_raft_state_string(int state)
 static void
 pg_raft_node_apply_log_cb(struct raft_apply *req, int status, void *result)
 {
+	XLogRecPtr recEnd;
 	pg_raft_node *n = req->data;
 	raft_free(req);
 	if (status != 0)
 	{
-		tracef("pg_raft_node_apply_log_cb: %s (%d)",
-				raft_errmsg(&n->raft), status);
+		ereport(PANIC,
+				(errmsg("raft replication failed to commit a log: \
+				%s (%d)", raft_errmsg(&n->raft), status)));
 		return;
 	}
-	SetRaftWalSndCtlLSN(FirstNormalUnloggedLSN);
+	recEnd = *(XLogRecPtr *) result;
+	RaftRepSetCommittedRecEnd(recEnd);
 	RaftRepReleaseWaiters();
 }
 
@@ -636,10 +638,9 @@ pg_raft_fsm_apply(struct raft_fsm *fsm,
 				const struct raft_buffer *buf, void **result)
 {
 	struct pg_raft_fsm *f = fsm->data;
-	if (buf->len != sizeof(uint64_t))
+	if (buf->len <= 2 * sizeof(uint64))
 		return RAFT_MALFORMED;
 	f->count = *(uint64_t *)buf->base;
-	*global_counter = (int32) f->count;
 	*result = &f->count;
 	return 0;
 }
@@ -668,7 +669,6 @@ pg_raft_fsm_restore(struct raft_fsm *fsm, struct raft_buffer *buf)
 	if (buf->len != sizeof(uint64_t))
 		return RAFT_MALFORMED;
 	f->count = *(uint64_t *)buf->base;
-	*global_counter = (int32) f->count;
 	// TODO normally the snapshot and restore happens on different nodes,
 	// we may need another pair of free / malloc?
 	raft_free(buf->base);
@@ -681,7 +681,7 @@ pg_raft_fsm_init(struct raft_fsm *fsm)
 	struct pg_raft_fsm *f = raft_malloc(sizeof *f);
 	if (f == NULL)
 		return RAFT_NOMEM;
-	f->count = (unsigned long long) *global_counter;
+	f->count = 0;
 	fsm->version = 1;
 	fsm->data = f;
 	fsm->apply = pg_raft_fsm_apply;

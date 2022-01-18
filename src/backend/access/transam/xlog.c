@@ -51,6 +51,7 @@
 #include "replication/logical.h"
 #include "replication/slot.h"
 #include "replication/origin.h"
+#include "replication/raftrep.h"
 #include "replication/snapbuild.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
@@ -2537,6 +2538,9 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 				/* signal that we need to wakeup walsenders later */
 				WalSndWakeupRequest();
 
+				/* signal that we need to wakeup raftserver later */
+				RaftWalSndWakeupRequest();
+
 				LogwrtResult.Flush = LogwrtResult.Write;	/* end of page */
 
 				if (XLogArchivingActive())
@@ -2607,6 +2611,9 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 
 		/* signal that we need to wakeup walsenders later */
 		WalSndWakeupRequest();
+
+		/* signal that we need to wakeup raftserver later */
+		RaftWalSndWakeupRequest();
 
 		LogwrtResult.Flush = LogwrtResult.Write;
 	}
@@ -2933,6 +2940,9 @@ XLogFlush(XLogRecPtr record)
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests();
 
+	/* wake up raftserver as well */
+	RaftWalSndWakeupProcessRequests();
+
 	/*
 	 * If we still haven't flushed to the request point then we have a
 	 * problem; most likely, the requested flush point is past end of XLOG.
@@ -3096,6 +3106,9 @@ XLogBackgroundFlush(void)
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests();
+
+	/* wake up raftserver as well */
+	RaftWalSndWakeupProcessRequests();
 
 	/*
 	 * Great, done. To take some work off the critical path, try to initialize
@@ -7302,6 +7315,8 @@ StartupXLOG(void)
 				/* Else, try to fetch the next WAL record */
 				record = ReadRecord(xlogreader, InvalidXLogRecPtr, LOG, false);
 			} while (record != NULL);
+			/* EUREKA TODO: sync startup replay loop with raftserver, to wait for
+			 * it to commit all raft log entries before exiting the replay */
 
 			/*
 			 * end of main redo apply loop
@@ -7408,6 +7423,10 @@ StartupXLOG(void)
 	 */
 	record = ReadRecord(xlogreader, LastRec, PANIC, false);
 	EndOfLog = EndRecPtr;
+
+	/* Initialize the record end for RaftWalSndCtl. The possible recovery
+	 * checkpoint below is not included */
+	RaftRepInitRecEnd(EndOfLog);
 
 	/*
 	 * EndOfLogTLI is the TLI in the filename of the XLOG segment containing

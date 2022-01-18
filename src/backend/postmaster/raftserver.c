@@ -40,6 +40,7 @@ static char *raft_cluster_addrs[] = {\
 };
 
 static volatile sig_atomic_t shutdown_requested = false;
+static StringInfo sendBuf = NULL;
 
 static void raftserver_sigusr1_handler(SIGNAL_ARGS);
 static void raftserver_shutdown_handler(SIGNAL_ARGS);
@@ -55,6 +56,8 @@ static void maybe_apply_raft_log(void);
 void
 RaftServerMain()
 {
+	MemoryContext raftserver_context;
+
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
 	 *
@@ -84,7 +87,12 @@ RaftServerMain()
 	/* Create raft log directory if not present; ignore errors */
 	(void) MakePGDirectory(raft_log_directory);
 
-	RaftRepInitConfig();
+	raftserver_context = AllocSetContextCreate(TopMemoryContext,
+												"RaftServer",
+												ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(raftserver_context);
+
+	RaftRepInit();
 	start_raft_server();
 
 	/* Notify postmaster we are ready */
@@ -92,6 +100,8 @@ RaftServerMain()
 
 	/* Unblock signals (they were blocked when the postmaster forked us) */
 	PG_SETMASK(&UnBlockSig);
+
+	sendBuf = makeStringInfo();
 
 	/* main worker loop */
 	for (;;)
@@ -104,7 +114,7 @@ RaftServerMain()
 		 */
 		if (shutdown_requested)
 		{
-			/* Finish sync of the remaining raft logs */
+			/* Finish replication of the remained xlog records */
 			maybe_apply_raft_log();
 			shutdown_raft_server();
 			/* Normal exit from the raftserver is here */
@@ -115,8 +125,8 @@ RaftServerMain()
 
 		/* Sleep until there's something to do */
 		(void) WaitLatch(MyLatch,
-					WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
-					100, WAIT_EVENT_RAFT_SERVER_MAIN);
+					WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
+					WAIT_EVENT_RAFT_SERVER_MAIN);
 	}
 }
 
@@ -126,14 +136,14 @@ start_raft_server(void)
 	int rc = 0;
 
 	if (raft_server_id > 2)
-		ereport(FATAL,
+		ereport(PANIC,
 				(errmsg("invalid raft_server_id value %d", raft_server_id)));
 
 	rc = pg_raft_node_create((pg_raft_node_id) raft_cluster_ids[raft_server_id],
 							raft_cluster_addrs[raft_server_id],
 							raft_log_directory, &raft_node);
 	if (rc != 0)
-		ereport(FATAL,
+		ereport(PANIC,
 				(errmsg("pg_raft_node_create failed with return code %d", rc)));
 
 	/* Pass down the hard-coded raft cluster config for bootstrap */
@@ -143,7 +153,7 @@ start_raft_server(void)
 
 	rc = pg_raft_node_start(raft_node, true);
 	if (rc != 0)
-		ereport(FATAL,
+		ereport(PANIC,
 				(errmsg("pg_raft_node_start failed with return code %d, \
 				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
 }
@@ -155,36 +165,36 @@ shutdown_raft_server(void)
 
 	rc = pg_raft_node_stop(raft_node);
 	if (rc != 0)
-		ereport(FATAL,
+		ereport(PANIC,
 				(errmsg("pg_raft_node_stop failed with return code %d, \
 				error msg %s", rc, pg_raft_node_errmsg(raft_node))));
 
 	pg_raft_node_destroy(raft_node);
 }
 
-static int32 saved_global_counter = 0;
-
 static void
 maybe_apply_raft_log(void)
 {
 	int rv = 0;
-	uint64_t log;
+	XLogRecPtr flushRecEnd;
+
 	if (!pg_raft_node_is_leader(raft_node))
 		return;
-	if (saved_global_counter != *global_counter)
-	{
-		saved_global_counter = *global_counter;
 
-		log = (uint64_t) saved_global_counter;
-		rv = pg_raft_node_apply_log(raft_node, &log, sizeof(log));
+	flushRecEnd = GetFlushRecPtr();
+	while (RaftRepGetRecordsForSend(flushRecEnd, sendBuf))
+	{
+		rv = pg_raft_node_apply_log(raft_node,
+						(void *) sendBuf->data, (size_t) sendBuf->len);
 		if (rv != 0)
-			ereport(LOG,
-					(errmsg("maybe_apply_raft_log failed (%d), \
+			ereport(PANIC,
+					(errmsg("raftserver failed in sending xlog(%d), \
 					error msg %s", rv, pg_raft_node_errmsg(raft_node))));
 		else
 			ereport(LOG,
-					(errmsg("finished apply log %ld", log)));
+					(errmsg("raftserver succeeded in sending xlog")));
 	}
+
 	return;
 }
 

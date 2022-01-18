@@ -23,13 +23,26 @@
 typedef struct
 {
 	/* Raft replication wait queue */
-	SHM_QUEUE   RaftRepQueue;
-	/* Current location of the xlog acknowledged by raft quorum */
-	XLogRecPtr  lsn;
+	SHM_QUEUE  RaftRepQueue;
+
+	/* Location of the xlog end+1 sent out by raft leader */
+	XLogRecPtr sentRecEnd;
+
+	/* Location of the xlog end+1 acknowledged by raft quorum majority */
+	XLogRecPtr committedRecEnd;
+
+	/*
+	 * Pointer to the raftserver's latch. Used by backends to wake up
+	 * raftserver when it has work to do.
+	 */
+	Latch      *latch;
 } RaftWalSndCtlData;
 
 /* Pointer of the global raft xlog sync state in shared memory */
 extern RaftWalSndCtlData *RaftWalSndCtl;
+
+/* State for RaftWalSndWakeupRequest */
+extern bool wakeup_raft_server;
 
 /* Allocate and initialize raft xlog sync state in shared memory */
 extern Size RaftWalSndShmemSize(void);
@@ -37,13 +50,38 @@ extern void RaftWalSndShmemInit(void);
 
 /* called by user backend */
 extern void RaftRepWaitForLSN(XLogRecPtr lsn);
+extern void RaftRepServerWakeup(void);
+
+/*
+ * Remember that we want to wakeup raftserver later
+ *
+ * This is separated from doing the actual wakeup because the xlog writeout
+ * is done while holding contended locks.
+ */
+#define RaftWalSndWakeupRequest() \
+	do { wakeup_raft_server = true; } while (0)
+
+/* wakeup raftserver if there is work to be done */
+#define RaftWalSndWakeupProcessRequests()	\
+	do										\
+	{										\
+		if (wakeup_raft_server)				\
+		{									\
+			wakeup_raft_server = false;		\
+			RaftRepServerWakeup();			\
+		}									\
+	} while (0)
 
 /* called at backend exit */
 extern void RaftRepCleanupAtProcExit(void);
 
 /* called by raftserver */
-extern void RaftRepInitConfig(void);
+extern void RaftRepInit(void);
 extern void RaftRepReleaseWaiters(void);
-extern void SetRaftWalSndCtlLSN(XLogRecPtr lsn);
+extern void RaftRepSetCommittedRecEnd(XLogRecPtr lsn);
+extern bool RaftRepGetRecordsForSend(XLogRecPtr lsn, StringInfo buf);
+
+/* called by startup process */
+void RaftRepInitRecEnd(XLogRecPtr lsn);
 
 #endif							/* _RAFTREP_H */
