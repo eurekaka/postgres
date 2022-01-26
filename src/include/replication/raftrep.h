@@ -22,31 +22,32 @@
 /* State of the xlog sync among raft quorum, protected by RaftRepLock */
 typedef struct
 {
-	/* Raft replication wait queue */
+	/* Raft replication wait queue, used by leader */
 	SHM_QUEUE  RaftRepQueue;
 
-	/* Location of the xlog end+1 sent out by raft leader */
-	XLogRecPtr sentRecEnd;
-
-	/* Location of the xlog end+1 acknowledged by raft quorum majority */
+	/* Location of the xlog end+1 acknowledged by raft quorum majority,
+	 * used by leader*/
 	XLogRecPtr committedRecEnd;
 
+	/* Location of the xlog end+1 received and fsynced, used by followers */
+	XLogRecPtr rcvFlushRecEnd;
+
 	/*
-	 * Pointer to the raftserver's latch. Used by backends to wake up
-	 * raftserver when it has work to do.
+	 * Pointer to the raftserver's latch. Used by backends / startup process
+	 * to wake up raftserver.
 	 */
 	Latch      *latch;
-} RaftWalSndCtlData;
+} RaftRepCtlData;
 
 /* Pointer of the global raft xlog sync state in shared memory */
-extern RaftWalSndCtlData *RaftWalSndCtl;
+extern RaftRepCtlData *RaftRepCtl;
 
 /* State for RaftWalSndWakeupRequest */
 extern bool wakeup_raft_server;
 
 /* Allocate and initialize raft xlog sync state in shared memory */
-extern Size RaftWalSndShmemSize(void);
-extern void RaftWalSndShmemInit(void);
+extern Size RaftRepShmemSize(void);
+extern void RaftRepShmemInit(void);
 
 /* called by user backend */
 extern void RaftRepWaitForLSN(XLogRecPtr lsn);
@@ -77,11 +78,13 @@ extern void RaftRepCleanupAtProcExit(void);
 
 /* called by raftserver */
 extern void RaftRepInit(void);
+extern void RaftRepReset(void);
 extern void RaftRepReleaseWaiters(void);
 extern void RaftRepSetCommittedRecEnd(XLogRecPtr lsn);
 extern bool RaftRepGetRecordsForSend(XLogRecPtr lsn, StringInfo buf);
+extern XLogRecPtr RaftRepWriteRecords(char *buf, Size nbytes);
 
-/* called by startup process */
+/* TODO: called by startup process */
 void RaftRepInitRecEnd(XLogRecPtr lsn);
 
 #endif							/* _RAFTREP_H */

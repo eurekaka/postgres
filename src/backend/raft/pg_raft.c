@@ -630,7 +630,7 @@ pg_raft_node_is_leader(pg_raft_node *n)
 
 struct pg_raft_fsm
 {
-	unsigned long long count;
+	XLogRecPtr end_of_log;
 };
 
 static int
@@ -640,11 +640,12 @@ pg_raft_fsm_apply(struct raft_fsm *fsm,
 	struct pg_raft_fsm *f = fsm->data;
 	if (buf->len <= 2 * sizeof(uint64))
 		return RAFT_MALFORMED;
-	f->count = *(uint64_t *)buf->base;
-	*result = &f->count;
+	f->end_of_log = RaftRepWriteRecords((char *) buf->base, buf->len);
+	*result = &f->end_of_log;
 	return 0;
 }
 
+/* TODO */
 static int
 pg_raft_fsm_snapshot(struct raft_fsm *fsm,
 			struct raft_buffer *bufs[], unsigned *n_bufs)
@@ -658,17 +659,18 @@ pg_raft_fsm_snapshot(struct raft_fsm *fsm,
 	(*bufs)[0].base = raft_malloc((*bufs)[0].len);
 	if ((*bufs)[0].base == NULL)
 		return RAFT_NOMEM;
-	*(uint64_t *)(*bufs)[0].base = f->count;
+	*(XLogRecPtr *)(*bufs)[0].base = f->end_of_log;
 	return 0;
 }
 
+/* TODO */
 static int
 pg_raft_fsm_restore(struct raft_fsm *fsm, struct raft_buffer *buf)
 {
 	struct pg_raft_fsm *f = fsm->data;
 	if (buf->len != sizeof(uint64_t))
 		return RAFT_MALFORMED;
-	f->count = *(uint64_t *)buf->base;
+	f->end_of_log = *(XLogRecPtr *)buf->base;
 	// TODO normally the snapshot and restore happens on different nodes,
 	// we may need another pair of free / malloc?
 	raft_free(buf->base);
@@ -681,7 +683,8 @@ pg_raft_fsm_init(struct raft_fsm *fsm)
 	struct pg_raft_fsm *f = raft_malloc(sizeof *f);
 	if (f == NULL)
 		return RAFT_NOMEM;
-	f->count = 0;
+	/* TODO: init end_of_log, for pg_raft_fsm_snapshot */
+	f->end_of_log = InvalidXLogRecPtr;
 	fsm->version = 1;
 	fsm->data = f;
 	fsm->apply = pg_raft_fsm_apply;

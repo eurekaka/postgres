@@ -7424,8 +7424,8 @@ StartupXLOG(void)
 	record = ReadRecord(xlogreader, LastRec, PANIC, false);
 	EndOfLog = EndRecPtr;
 
-	/* Initialize the record end for RaftWalSndCtl. The possible recovery
-	 * checkpoint below is not included */
+	/* TODO: Initialize the record end for RaftRepCtl. The possible recovery
+	 * checkpoint below is not included. Move this to raftserver */
 	RaftRepInitRecEnd(EndOfLog);
 
 	/*

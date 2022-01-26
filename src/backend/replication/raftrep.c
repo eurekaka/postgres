@@ -22,7 +22,7 @@
 #include "utils/ps_status.h"
 
 /* Pointer of the global raft xlog sync state in shared memory */
-RaftWalSndCtlData *RaftWalSndCtl = NULL;
+RaftRepCtlData *RaftRepCtl = NULL;
 
 /* State for RaftWalSndWakeupRequest */
 bool wakeup_raft_server = false;
@@ -31,6 +31,24 @@ bool wakeup_raft_server = false;
 static int sendFile = -1;
 static XLogSegNo sendSegNo = 0;
 static uint32 sendOff = 0;
+
+/* Location of the xlog end+1 sent out, used by leader */
+static XLogRecPtr SentRecEnd;
+
+/* Variables used by RaftRepXLogWrite to track the writing progress */
+static int recvFile = -1;
+static XLogSegNo recvSegNo = 0;
+static uint32 recvOff = 0;
+
+/*
+ * LogRcvResult indicates the byte positions that we have already
+ * written/fsynced.
+ */
+static struct
+{
+	XLogRecPtr Write;			/* last byte + 1 written out */
+	XLogRecPtr Flush;			/* last byte + 1 flushed */
+} LogRcvResult;
 
 static void RaftRepQueueInsert(void);
 static void RaftRepCancelWait(void);
@@ -42,33 +60,37 @@ static void RaftRepXLogRead(char *buf, XLogRecPtr startPtr, Size count);
 static bool RaftRepQueueIsOrderedByLSN(void);
 #endif
 
+static void RaftRepXLogWrite(char *buf, XLogRecPtr recptr, Size nbytes);
+static void RaftRepXLogFlush();
+static void RaftRepXLogClose(XLogRecPtr recptr);
+
 /*
  * ===========================================================
  * Raft Replication functions for postmaster
  * ===========================================================
  */
 
-/* Report shared-memory space needed by RaftWalSndShmemInit */
+/* Report shared-memory space needed by RaftRepShmemInit */
 Size
-RaftWalSndShmemSize(void)
+RaftRepShmemSize(void)
 {
-	return sizeof(RaftWalSndCtlData);
+	return sizeof(RaftRepCtlData);
 }
 
 /* Allocate and initialize raft xlog sync state in shared memory */
 void
-RaftWalSndShmemInit(void)
+RaftRepShmemInit(void)
 {
 	bool found;
 
-	RaftWalSndCtl = (RaftWalSndCtlData *)
-		ShmemInitStruct("Raft Wal Sender Ctl", RaftWalSndShmemSize(), &found);
+	RaftRepCtl = (RaftRepCtlData *)
+		ShmemInitStruct("Raft Rep Ctl", RaftRepShmemSize(), &found);
 
 	if (!found)
 	{
 		/* First time through, so initialize */
-		MemSet(RaftWalSndCtl, 0, RaftWalSndShmemSize());
-		SHMQueueInit(&(RaftWalSndCtl->RaftRepQueue));
+		MemSet(RaftRepCtl, 0, RaftRepShmemSize());
+		SHMQueueInit(&(RaftRepCtl->RaftRepQueue));
 	}
 }
 
@@ -96,12 +118,12 @@ RaftRepWaitForLSN(XLogRecPtr lsn)
 	const char *old_status;
 
 	Assert(SHMQueueIsDetached(&(MyProc->raftRepLinks)));
-	Assert(RaftWalSndCtl != NULL);
+	Assert(RaftRepCtl != NULL);
 
 	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
 	Assert(MyProc->raftRepState == RAFT_REP_NOT_WAITING);
 
-	if (lsn <= RaftWalSndCtl->committedRecEnd)
+	if (lsn <= RaftRepCtl->committedRecEnd)
 	{
 		LWLockRelease(RaftRepLock);
 		return;
@@ -252,8 +274,8 @@ RaftRepQueueInsert()
 {
 	PGPROC	   *proc;
 
-	proc = (PGPROC *) SHMQueuePrev(&(RaftWalSndCtl->RaftRepQueue),
-								   &(RaftWalSndCtl->RaftRepQueue),
+	proc = (PGPROC *) SHMQueuePrev(&(RaftRepCtl->RaftRepQueue),
+								   &(RaftRepCtl->RaftRepQueue),
 								   offsetof(PGPROC, raftRepLinks));
 
 	while (proc)
@@ -265,7 +287,7 @@ RaftRepQueueInsert()
 		if (proc->raftWaitLSN < MyProc->raftWaitLSN)
 			break;
 
-		proc = (PGPROC *) SHMQueuePrev(&(RaftWalSndCtl->RaftRepQueue),
+		proc = (PGPROC *) SHMQueuePrev(&(RaftRepCtl->RaftRepQueue),
 									   &(proc->raftRepLinks),
 									   offsetof(PGPROC, raftRepLinks));
 	}
@@ -273,7 +295,7 @@ RaftRepQueueInsert()
 	if (proc)
 		SHMQueueInsertAfter(&(proc->raftRepLinks), &(MyProc->raftRepLinks));
 	else
-		SHMQueueInsertAfter(&(RaftWalSndCtl->RaftRepQueue), &(MyProc->raftRepLinks));
+		SHMQueueInsertAfter(&(RaftRepCtl->RaftRepQueue), &(MyProc->raftRepLinks));
 }
 
 /*
@@ -312,10 +334,10 @@ void
 RaftRepServerWakeup(void)
 {
 	Latch *latch;
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
-	Assert(walsndctl != NULL);
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
+	Assert(raftrepctl != NULL);
 
-	latch = walsndctl->latch;
+	latch = raftrepctl->latch;
 	if (latch != NULL)
 		SetLatch(latch);
 }
@@ -334,13 +356,17 @@ void
 RaftRepInit(void)
 {
 	/* TODO: init the raft server list and id here */
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
-	Assert(walsndctl != NULL);
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
+	Assert(raftrepctl != NULL);
 
 	/* No lock needed since we are in startup stage */
-	walsndctl->sentRecEnd = InvalidXLogRecPtr;
-	walsndctl->committedRecEnd = InvalidXLogRecPtr;
-	walsndctl->latch = &MyProc->procLatch;
+	raftrepctl->committedRecEnd = InvalidXLogRecPtr;
+	raftrepctl->rcvFlushRecEnd = InvalidXLogRecPtr;
+	raftrepctl->latch = &MyProc->procLatch;
+
+	/* TODO: init this to EndOfLog, for SentRecEnd as well */
+	LogRcvResult.Write = LogRcvResult.Flush = GetXLogReplayRecPtr(NULL);
+	SentRecEnd = InvalidXLogRecPtr;
 
 	on_shmem_exit(RaftRepDestroy, 0);
 }
@@ -348,14 +374,20 @@ RaftRepInit(void)
 static void
 RaftRepDestroy(void)
 {
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
-	Assert(walsndctl != NULL);
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
+	Assert(raftrepctl != NULL);
 
 	/* No lock needed since we are shutting down */
-	walsndctl->sentRecEnd = InvalidXLogRecPtr;
-	walsndctl->committedRecEnd = InvalidXLogRecPtr;
-	walsndctl->latch = NULL;
+	raftrepctl->committedRecEnd = InvalidXLogRecPtr;
+	raftrepctl->rcvFlushRecEnd = InvalidXLogRecPtr;
+	raftrepctl->latch = NULL;
 	RaftValSndCtl = NULL;
+}
+
+/* Reset replication state when raft state changes */
+void
+RaftRepReset(void)
+{
 }
 
 /*
@@ -387,15 +419,15 @@ RaftRepReleaseWaiters(void)
 static int
 RaftRepWakeQueue(bool all)
 {
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
 	PGPROC	   *proc = NULL;
 	PGPROC	   *thisproc = NULL;
 	int			numprocs = 0;
 
 	Assert(RaftRepQueueIsOrderedByLSN());
 
-	proc = (PGPROC *) SHMQueueNext(&(RaftWalSndCtl->RaftRepQueue),
-								   &(RaftWalSndCtl->RaftRepQueue),
+	proc = (PGPROC *) SHMQueueNext(&(RaftRepCtl->RaftRepQueue),
+								   &(RaftRepCtl->RaftRepQueue),
 								   offsetof(PGPROC, raftRepLinks));
 
 	while (proc)
@@ -403,7 +435,7 @@ RaftRepWakeQueue(bool all)
 		/*
 		 * Assume the queue is ordered by LSN
 		 */
-		if (!all && walsndctl->committedRecEnd < proc->raftWaitLSN)
+		if (!all && raftrepctl->committedRecEnd < proc->raftWaitLSN)
 			return numprocs;
 
 		/*
@@ -411,7 +443,7 @@ RaftRepWakeQueue(bool all)
 		 * thisproc is valid, proc may be NULL after this.
 		 */
 		thisproc = proc;
-		proc = (PGPROC *) SHMQueueNext(&(RaftWalSndCtl->RaftRepQueue),
+		proc = (PGPROC *) SHMQueueNext(&(RaftRepCtl->RaftRepQueue),
 									   &(proc->raftRepLinks),
 									   offsetof(PGPROC, raftRepLinks));
 
@@ -449,26 +481,26 @@ RaftRepSetCommittedRecEnd(XLogRecPtr lsn)
 {
 	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
 
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
-	walsndctl->committedRecEnd = lsn;
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
+	raftrepctl->committedRecEnd = lsn;
 
 	LWLockRelease(RaftRepLock);
 
-	elog(LOG, "update RaftWalSndCtl->committedRecEnd to %X/%X",
+	elog(LOG, "update RaftRepCtl->committedRecEnd to %X/%X",
 			(uint32) (lsn >> 32), (uint32) lsn);
 }
 
 void
 RaftRepInitRecEnd(XLogRecPtr lsn)
 {
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
 
 	LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
-	walsndctl->committedRecEnd = lsn;
+	raftrepctl->committedRecEnd = lsn;
 	LWLockRelease(RaftRepLock);
 
-	walsndctl->sentRecEnd = lsn;
-	elog(LOG, "init RaftWalSndCtl->sentRecEnd to %X/%X",
+	SentRecEnd = lsn;
+	elog(LOG, "init SentRecEnd to %X/%X",
 			(uint32) (lsn >> 32), (uint32) lsn);
 }
 
@@ -489,6 +521,15 @@ encodeRecPtr(StringInfo buf, XLogRecPtr lsn)
 	enlargeStringInfo(buf, sizeof(ni));
 	memcpy((char *) (buf->data + buf->len), &ni, sizeof(ni));
 	buf->len += sizeof(ni);
+}
+
+static inline void
+decodeRecPtr(char **buf, XLogRecPtr *lsn)
+{
+	uint64 ni;
+	memcpy(&ni, *buf, sizeof(ni))
+	*buf = (*buf) + sizeof(ni);
+	*lsn = (XlogRecPtr) pg_ntoh64(ni);
 }
 
 /*
@@ -616,14 +657,12 @@ RaftRepGetRecordsForSend(XLogRecPtr lsn, StringInfo buf)
 {
 	Size nbytes;
 	XLogRecPtr sentRecEnd, startPtr, endPtr;
-	volatile RaftWalSndCtlData *walsndctl = RaftWalSndCtl;
+	volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
 
 	if (XLogRecPtrIsInvalid(lsn))
 		return false;
 
-	/* No lock needed for sentRecEnd, since it is only accessed by this
-	 * this function, called in the main thread of raftserver */
-	sentRecEnd = walsndctl.sentRecEnd;
+	sentRecEnd = SentRecEnd;
 	if (XLogRecPtrIsInvalid(sentRecEnd))
 		return false;
 	Assert(sentRecEnd <= lsn);
@@ -668,8 +707,10 @@ RaftRepGetRecordsForSend(XLogRecPtr lsn, StringInfo buf)
 	buf->len += nbytes;
 	buf->data[buf->len] = '\0';
 
-	/* Update shared memory status, no lock needed */
-	walsndctl->sentRecEnd = endPtr;
+	SentRecEnd = endPtr;
+	/* Update LogRcvResult as well, to avoid writing duplicate XLOG records
+	 * in leader */
+	LogRcvResult.Write = LogRcvResult.Flush = endPtr;
 
 	/* Report progress of XLOG streaming in PS display */
 	if (update_process_title)
@@ -693,8 +734,8 @@ RaftRepQueueIsOrderedByLSN(void)
 
 	lastLSN = 0;
 
-	proc = (PGPROC *) SHMQueueNext(&(RaftWalSndCtl->RaftRepQueue),
-								   &(RaftWalSndCtl->RaftRepQueue),
+	proc = (PGPROC *) SHMQueueNext(&(RaftRepCtl->RaftRepQueue),
+								   &(RaftRepCtl->RaftRepQueue),
 								   offsetof(PGPROC, raftRepLinks));
 
 	while (proc)
@@ -708,7 +749,7 @@ RaftRepQueueIsOrderedByLSN(void)
 
 		lastLSN = proc->raftWaitLSN;
 
-		proc = (PGPROC *) SHMQueueNext(&(RaftWalSndCtl->RaftRepQueue),
+		proc = (PGPROC *) SHMQueueNext(&(RaftRepCtl->RaftRepQueue),
 									   &(proc->raftRepLinks),
 									   offsetof(PGPROC, raftRepLinks));
 	}
@@ -716,3 +757,183 @@ RaftRepQueueIsOrderedByLSN(void)
 	return true;
 }
 #endif
+
+/* Write and fsync received XLOG extracted from raft log to disk */
+XLogRecPtr
+RaftRepWriteRecords(char *buf, Size nbytes)
+{
+	char *cursor;
+	XLogRecPtr startPtr, endPtr;
+
+	Assert(nbytes > 2 * sizeof(uint64));
+	nbytes -= (2 * sizeof(uint64));
+
+	cursor = buf;
+	decodeRecPtr(&cursor, &startPtr);
+	decodeRecPtr(&cursor, &endPtr);
+
+	if (endPtr - startPtr != nbytes)
+		elog(PANIC, "unexpected XLOG records extracted from raft log, \
+			startPtr %X/%X, endPtr %X/%X, length %ld",
+			(uint32) (startPtr >> 32), (uint32) startPtr,
+			(uint32) (endPtr >> 32), (uint32) endPtr,
+			nbytes);
+
+	/* Update SentRecEnd since we may be elected a leader later */
+	/* TODO: we need to re-compute this in StartupXLOG? */
+	SentRecEnd = endPtr;
+
+	RaftRepXLogWrite(cursor, startPtr, nbytes);
+
+	return endPtr;
+}
+
+/* Write and fsync XLOG data to disk */
+static void
+RaftRepXLogWrite(char *buf, XLogRecPtr recptr, Size nbytes)
+{
+	int startOff, bytesWritten;
+
+	/* Ignore the log if the local one is more up-to-date */
+	if (recptr < LogRcvResult.Write)
+	{
+		/* Two raft committed logs cannot contain overlapped xlog records */
+		Assert(recptr + nbytes <= LogRcvResult.Write);
+		return;
+	}
+
+	/* Sanity check of the received log records, no hole is allowed in the
+	 * log sequence */
+	if (recptr != LogRcvResult.Write)
+		elog(PANIC, "xlog records %X/%X received, expecting %X/%X",
+			(uint32) (recptr >> 32), (uint32) recptr,
+			(uint32) (LogRcvResult.Write >> 32), (uint32) LogRcvResult.Write);
+
+	while (nbytes > 0)
+	{
+		int segBytes;
+
+		/* Close the current segment if it's completed */
+		if (recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+			RaftRepXLogClose(recptr);
+
+		if (recvFile < 0)
+		{
+			bool reuse = true;
+
+			/* Create / reuse log file */
+			XLByteToSeg(recptr, recvSegNo, wal_segment_size);
+			recvFile = XLogFileInit(recvSegNo, &reuse, true);
+			recvOff = 0;
+		}
+
+		/* Calculate the start offset of the received logs */
+		startOff = XLogSegmentOffset(recptr, wal_segment_size);
+
+		if (startOff + nbytes > wal_segment_size)
+			segBytes = wal_segment_size - startOff;
+		else
+			segBytes = nbytes;
+
+		/* Need to seek in the file? */
+		if (recvOff != startOff)
+		{
+			if (lseek(recvFile, (off_t) startOff, SEEK_SET) < 0)
+				ereport(PANIC,
+						(errcode_for_file_access(),
+						 errmsg("could not seek in log segment %s to offset %u: %m",
+								XLogFileNameP(ThisTimeLineID, recvSegNo),
+								startOff)));
+			recvOff = startOff;
+		}
+
+		/* OK to write the logs */
+		errno = 0;
+
+		bytesWritten = write(recvFile, buf, segBytes);
+		if (bytesWritten <= 0)
+		{
+			/* if write didn't set errno, assume no disk space */
+			if (errno == 0)
+				errno = ENOSPC;
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write to log segment %s "
+							"at offset %u, length %lu: %m",
+							XLogFileNameP(ThisTimeLineID, recvSegNo),
+							recvOff, (unsigned long) segBytes)));
+		}
+
+		/* Proceed the state for write */
+		recptr += bytesWritten;
+		recvOff += bytesWritten;
+		nbytes -= bytesWritten;
+		buf += bytesWritten;
+
+		LogRcvResult.Write = recptr;
+	}
+
+	/*
+	 * Close the current segment if it's fully written up in the last
+	 * cycle of the loop.
+	 */
+	if (recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+		RaftRepXLogClose(recptr);
+
+	RaftRepXLogFlush();
+}
+
+/* Flush the log to disk */
+static void
+RaftRepXLogFlush()
+{
+	if (LogRcvResult.Flush < LogRcvResult.Write)
+	{
+		volatile RaftRepCtlData *raftrepctl = RaftRepCtl;
+		Assert(raftrepctl != NULL);
+
+		issue_xlog_fsync(recvFile, recvSegNo);
+		LogRcvResult.Flush = LogRcvResult.Write;
+
+		/* Update shared-memory status */
+		LWLockAcquire(RaftRepLock, LW_EXCLUSIVE);
+		if (raftrepctl->rcvFlushRecEnd < LogRcvResult.Flush)
+			raftrepctl->rcvFlushRecEnd = LogRcvResult.Flush;
+		LWLockRelease(RaftRepLock);
+
+		/* Report XLOG receiving progress in PS display */
+		if (update_process_title)
+		{
+			char activitymsg[50];
+			snprintf(activitymsg, sizeof(activitymsg), "receive flushed %X/%X",
+					 (uint32) (LogRcvResult.Flush >> 32),
+					 (uint32) LogRcvResult.Flush);
+			set_ps_display(activitymsg, false);
+		}
+	}
+}
+
+/*
+ * Close the current segment.
+ *
+ * Flush the segment to disk before closing it.
+ */
+static void
+RaftRepXLogClose(XLogRecPtr recptr)
+{
+	char xlogfname[MAXFNAMELEN];
+
+	Assert(recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size));
+
+	RaftRepXLogFlush();
+
+	XLogFileName(xlogfname, ThisTimeLineID, recvSegNo, wal_segment_size);
+
+	if (close(recvFile) != 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not close log segment %s: %m",
+						xlogfname)));
+
+	recvFile = -1;
+}
